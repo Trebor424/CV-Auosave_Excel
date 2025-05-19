@@ -1,0 +1,183 @@
+import requests
+import json
+import os
+from openpyxl import Workbook
+import datetime
+
+class ClickUpExporter:
+    """
+    A class for exporting tasks from multiple ClickUp lists to a single Excel file.
+    """
+    def __init__(self, api_token, team_id, list_ids, output_path, output_filename_format):
+        """
+        Initializes the ClickUpExporter object.
+
+        Args:
+            api_token (str): The ClickUp API token.
+            team_id (str): The ClickUp team ID.
+            list_ids (dict): A dictionary containing sheet names and their corresponding ClickUp list IDs.
+                            The keys of the dictionary will be the sheet names in the Excel file.
+            output_path (str): The path to the directory where the Excel file will be saved.
+            output_filename_format (str): The format of the Excel filename, e.g., 'backup_{date}.xlsx', where {date} will be replaced with the current date.
+        """
+        self.api_token = api_token
+        self.team_id = team_id
+        self.list_ids = list_ids
+        self.output_path = output_path
+        self.output_filename_format = output_filename_format
+
+    def _get_tasks_from_list(self, list_id):
+        """
+        Retrieves tasks from a specified ClickUp list.
+
+        Args:
+            list_id (str): The ID of the ClickUp list.
+
+        Returns:
+            list: A list of dictionaries representing the tasks. Returns an empty list in case of an error.
+        """
+        url = f"https://api.clickup.com/api/v2/list/{list_id}/task"
+        headers = {"Authorization": self.api_token}
+        params = {"include_subtasks": "true"}
+        try:
+            response = requests.get(url, headers=headers, params=params)
+            response.raise_for_status()  # Raise an exception for HTTP error codes
+            return response.json().get("tasks", [])
+        except requests.exceptions.RequestException as e:
+            print(f"Error retrieving tasks from list with ID {list_id}: {e}")
+            return []
+
+    def _get_field_value(self, field):
+        """
+        Retrieves and formats the value of a custom field in a ClickUp task.
+
+        Args:
+            field (dict): A dictionary representing the custom field.
+
+        Returns:
+            str: The formatted value of the field as a string. Handles various ClickUp field types.
+        """
+        field_name = field.get("name")
+        field_type = field.get("type")
+        field_value = field.get("value")
+
+        if field_value is None:
+            return ""
+
+        if field_type == "text" or field_type == "short_text" or field_type == "email" or field_type == "phone" or field_type == "url":
+            return field_value if isinstance(field_value, str) else ""
+        elif field_type == "number" or field_type == "rating" or field_type == "auto_increment":
+            return str(field_value)
+        elif field_type == "checkbox":
+            return "Yes" if field_value else "No"
+        elif field_type == "dropdown":
+            return field_value.get("name") if isinstance(field_value, dict) and field_value.get("name") else ""
+        elif field_type == "date" or field_type == "time":
+            return str(field_value / 1000)  # Convert milliseconds to seconds
+        elif field_type == "users" or field_type == "labels" or field_type == "multi_select":
+            if isinstance(field_value, list):
+                return ", ".join(item.get("username") if field_type == "users" else item.get("name") for item in field_value if item)
+            else:
+                return ""
+        elif field_type == "location":
+            return field_value.get("name") if isinstance(field_value, dict) and field_value else ""
+        elif field_type == "relationship":
+            if isinstance(field_value, list):
+                return ", ".join(linked_task.get("name") for linked_task in field_value if linked_task)
+            else:
+                return ""
+        elif field_type == "formula":
+            return field_value.get("text") if isinstance(field_value, dict) and field_value else ""
+        elif field_type == "created_by" or field_type == "updated_by":
+            return field_value.get("username") if isinstance(field_value, dict) and field_value else ""
+        else:
+            return str(field_value) if field_value is not None else f"Unsupported type: {field_type}"
+
+    def _process_task(self, task, custom_field_names):
+        """
+        Processes a single task, extracting its name and custom field values.
+
+        Args:
+            task (dict): A dictionary representing a ClickUp task.
+            custom_field_names (dict): A dictionary containing the names of all unique custom fields found across all tasks.
+
+        Returns:
+            list: A list containing the task name and the values of its custom fields in the order of `custom_field_names`.
+        """
+        row_data = [task.get("name", "")]
+        custom_field_values = {name: "" for name in custom_field_names.keys()}
+        for field in task.get("custom_fields", []):
+            field_name = field.get("name")
+            custom_field_values[field_name] = self._get_field_value(field)
+        row_data.extend(custom_field_values.values())
+        return row_data
+
+    def export_to_excel(self):
+        """
+        Exports tasks from the defined ClickUp lists to an Excel file.
+        Each list is saved in a separate sheet.
+        """
+        try:
+            workbook = Workbook()
+
+            for sheet_name, list_id in self.list_ids.items():
+                tasks = self._get_tasks_from_list(list_id)
+                if not tasks:
+                    print(f"No tasks found for export from list '{sheet_name}'.")
+                    continue
+
+                sheet = workbook.create_sheet(title=sheet_name)
+                headers = ["Task Name"]
+                custom_field_names = {}
+                for task in tasks:
+                    for field in task.get("custom_fields", []):
+                        custom_field_names[field.get("name")] = True
+                headers.extend(custom_field_names.keys())
+                sheet.append(headers)
+
+                for task in tasks:
+                    row_data = self._process_task(task, custom_field_names)
+                    sheet.append(row_data)
+
+            # Remove the default "Sheet" if more sheets have been added
+            if len(workbook.sheetnames) > 1 and "Sheet" in workbook.sheetnames:
+                del workbook["Sheet"]
+
+            output_filename = self.output_filename_format.format(date=datetime.date.today().strftime('%Y-%m-%d'))
+            filepath = os.path.join(self.output_path, output_filename)
+            workbook.save(filepath)
+            print(f"Data from lists saved to: {filepath}")
+
+        except Exception as e:
+            print(f"Error during Excel file saving: {e}")
+        finally:
+            try:
+                workbook.close()
+            except Exception as e:
+                print(f"Error closing the Excel file: {e}")
+
+if __name__ == "__main__":
+    # Configuration
+    CLICKUP_API_TOKEN = "pk_87837627_NI1EQE29DAN5ZZ5S7QXU87CISZ8RMLIH"   # Replace with your ClickUp API token
+    CLICKUP_TEAM_ID = "4611656"   # Replace with your ClickUp team ID
+
+    # List IDs to retrieve
+    LIST_IDS = {
+        "Biuro": "901209083133",
+        "MP Energy": "901209058221",
+        "Wykonawstwo": "901209041384",
+        "Kontakty OSD": "901209526076",
+    }
+
+    # Opening the text file and reading its content (to save the file in the specified location)
+    with open('BackupPath.txt', 'r') as file:
+        content = file.read()   # Reads the entire file
+        print(content)
+
+    OUTPUT_PATH=content # You can hardcode the path here <-------
+
+    #OUTPUT_PATH = os.path.join(os.path.expanduser("~"), "Desktop")
+    OUTPUT_FILENAME = f"0000 Kontakty_BACKUP[{datetime.date.today().strftime('%Y-%m-%d')}].xlsx"
+
+    exporter = ClickUpExporter(CLICKUP_API_TOKEN, CLICKUP_TEAM_ID, LIST_IDS, OUTPUT_PATH, OUTPUT_FILENAME)
+    exporter.export_to_excel()
